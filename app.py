@@ -4,9 +4,8 @@ from datetime import datetime
 from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
+import requests
 import streamlit as st
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 from zoneinfo import ZoneInfo
 
 
@@ -17,50 +16,72 @@ st.set_page_config(
 )
 
 
-# 유튜브 주소에서 영상 아이디를 찾는 함수입니다.
-def get_video_id(address: str) -> str | None:
-    if not address:
+기본_주소 = "https://www.youtube.com/watch?v=WXuK6gekU1Y"
+
+
+# 유튜브 API 주소입니다.
+댓글_API_주소 = "https://www.googleapis.com/youtube/v3/commentThreads"
+
+
+# 유튜브 영상 아이디는 보통 11글자입니다.
+영상_ID_규칙 = re.compile(r"^[a-zA-Z0-9_-]{11}$")
+
+
+def 비밀키_읽기():
+    """Streamlit 비밀키에서 유튜브 API 키를 읽습니다."""
+    try:
+        api_key = st.secrets.get("youtube_api_key", "")
+        if isinstance(api_key, str) and api_key.strip():
+            return api_key.strip()
+        return None
+    except Exception:
         return None
 
-    text = address.strip()
 
-    # 주소가 아니라 영상 아이디만 넣은 경우도 처리합니다.
-    if re.fullmatch(r"[a-zA-Z0-9_-]{11}", text):
-        return text
+def 영상_id_찾기(주소):
+    """일반 링크, 짧은 링크, shorts, embed, live 주소에서 영상 아이디를 찾습니다."""
+    if not 주소:
+        return None
 
-    # 주소 앞에 https://가 빠진 경우도 처리합니다.
-    if not text.startswith(("http://", "https://")):
-        text = "https://" + text
+    주소 = 주소.strip()
+
+    # 영상 아이디만 바로 넣은 경우
+    if 영상_ID_규칙.fullmatch(주소):
+        return 주소
+
+    # https:// 없이 입력한 경우도 처리합니다.
+    if not 주소.startswith(("http://", "https://")):
+        주소 = "https://" + 주소
 
     try:
-        parsed = urlparse(text)
-        host = parsed.netloc.lower()
-        path = parsed.path.strip("/")
-        query = parse_qs(parsed.query)
+        파싱 = urlparse(주소)
+        도메인 = 파싱.netloc.lower()
+        경로 = 파싱.path.strip("/")
+        쿼리 = parse_qs(파싱.query)
 
-        # 일반 링크: https://www.youtube.com/watch?v=영상아이디
-        if "youtube.com" in host and "v" in query:
-            video_id = query.get("v", [""])[0]
-            if re.fullmatch(r"[a-zA-Z0-9_-]{11}", video_id):
-                return video_id
+        # 일반 주소: youtube.com/watch?v=영상아이디
+        if "youtube.com" in 도메인 and "v" in 쿼리:
+            영상_id = 쿼리.get("v", [""])[0]
+            if 영상_ID_규칙.fullmatch(영상_id):
+                return 영상_id
 
-        # 짧은 링크: https://youtu.be/영상아이디
-        if "youtu.be" in host:
-            video_id = path.split("/")[0]
-            if re.fullmatch(r"[a-zA-Z0-9_-]{11}", video_id):
-                return video_id
+        # 짧은 주소: youtu.be/영상아이디
+        if "youtu.be" in 도메인:
+            영상_id = 경로.split("/")[0]
+            if 영상_ID_규칙.fullmatch(영상_id):
+                return 영상_id
 
-        # shorts: https://www.youtube.com/shorts/영상아이디
-        # embed: https://www.youtube.com/embed/영상아이디
-        # live: https://www.youtube.com/live/영상아이디
-        parts = path.split("/")
-        for key in ["shorts", "embed", "live"]:
-            if key in parts:
-                index = parts.index(key)
-                if len(parts) > index + 1:
-                    video_id = parts[index + 1]
-                    if re.fullmatch(r"[a-zA-Z0-9_-]{11}", video_id):
-                        return video_id
+        # shorts/embed/live 주소 처리
+        경로_조각들 = 경로.split("/")
+        가능한_형태 = ["shorts", "embed", "live", "v"]
+
+        for 형태 in 가능한_형태:
+            if 형태 in 경로_조각들:
+                위치 = 경로_조각들.index(형태)
+                if len(경로_조각들) > 위치 + 1:
+                    영상_id = 경로_조각들[위치 + 1]
+                    if 영상_ID_규칙.fullmatch(영상_id):
+                        return 영상_id
 
         return None
 
@@ -68,86 +89,130 @@ def get_video_id(address: str) -> str | None:
         return None
 
 
-# 유튜브 연결을 한 번 만들면 다시 사용합니다.
+def 한국시간으로_바꾸기(utc_시간문자):
+    """UTC 시간을 한국 시간으로 바꿉니다."""
+    try:
+        utc_시간 = datetime.fromisoformat(utc_시간문자.replace("Z", "+00:00"))
+        한국_시간 = utc_시간.astimezone(ZoneInfo("Asia/Seoul"))
+        return 한국_시간.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return ""
+
+
 @st.cache_resource
-def get_youtube_client(api_key: str):
-    return build("youtube", "v3", developerKey=api_key)
+def 유튜브_연결_만들기():
+    """유튜브 API 호출에 사용할 연결을 한 번만 만듭니다."""
+    연결 = requests.Session()
+    연결.headers.update({"Accept": "application/json"})
+    return 연결
 
 
-# UTC 시간을 한국 시간으로 바꿉니다.
-def change_to_korea_time(utc_text: str) -> str:
-    utc_time = datetime.fromisoformat(utc_text.replace("Z", "+00:00"))
-    korea_time = utc_time.astimezone(ZoneInfo("Asia/Seoul"))
-    return korea_time.strftime("%Y-%m-%d %H:%M:%S")
+def 오류_메시지_고르기(응답):
+    """유튜브 API 오류를 쉬운 문장으로 바꿉니다."""
+    상태코드 = 응답.status_code
+
+    try:
+        오류정보 = 응답.json()
+    except Exception:
+        오류정보 = {}
+
+    오류목록 = 오류정보.get("error", {}).get("errors", [])
+    오류사유 = ""
+
+    if 오류목록 and isinstance(오류목록, list):
+        오류사유 = 오류목록[0].get("reason", "")
+
+    오류사유_소문자 = 오류사유.lower()
+    응답내용_소문자 = 응답.text.lower()
+
+    if 상태코드 == 403 and (
+        "commentsdisabled" in 오류사유_소문자
+        or "comments disabled" in 응답내용_소문자
+        or "disabled comments" in 응답내용_소문자
+    ):
+        return "이 영상은 댓글을 볼수 없어요."
+
+    if 상태코드 == 403 and (
+        "quotaexceeded" in 오류사유_소문자
+        or "dailylimitexceeded" in 오류사유_소문자
+        or "quota" in 응답내용_소문자
+    ):
+        return "오늘 사용할 수 있는 조회량이 다 됐어요."
+
+    return "댓글을 가져오는 중 문제가 생겼어요. 주소와 키를 다시 확인해 주세요."
 
 
-# 댓글을 가져오는 함수입니다.
-def fetch_comments(youtube, video_id: str, max_comments: int) -> list[dict]:
-    comments = []
-    next_page_token = None
+def 댓글_가져오기(api_key, 영상_id, 가져올_개수):
+    """유튜브 댓글을 인기순으로 가져옵니다."""
+    연결 = 유튜브_연결_만들기()
 
-    while len(comments) < max_comments:
-        request = youtube.commentThreads().list(
-            part="snippet",
-            videoId=video_id,
-            maxResults=min(100, max_comments - len(comments)),
-            order="relevance",
-            textFormat="plainText",
-            pageToken=next_page_token,
-        )
+    댓글목록 = []
+    다음페이지 = None
 
-        response = request.execute()
+    while len(댓글목록) < 가져올_개수:
+        한번에_가져올_개수 = min(100, 가져올_개수 - len(댓글목록))
 
-        for item in response.get("items", []):
-            snippet = item["snippet"]["topLevelComment"]["snippet"]
+        요청값 = {
+            "key": api_key,
+            "part": "snippet",
+            "videoId": 영상_id,
+            "maxResults": 한번에_가져올_개수,
+            "order": "relevance",
+            "textFormat": "plainText",
+        }
 
-            comments.append(
-                {
-                    "댓글 내용": snippet.get("textDisplay", ""),
-                    "작성 시각(한국시간)": change_to_korea_time(snippet.get("publishedAt", "")),
-                    "좋아요 수": snippet.get("likeCount", 0),
-                }
-            )
+        if 다음페이지:
+            요청값["pageToken"] = 다음페이지
 
-        next_page_token = response.get("nextPageToken")
+        응답 = 연결.get(댓글_API_주소, params=요청값, timeout=20)
 
-        if not next_page_token:
+        if not 응답.ok:
+            raise RuntimeError(오류_메시지_고르기(응답))
+
+        데이터 = 응답.json()
+
+        for 항목 in 데이터.get("items", []):
+            try:
+                댓글정보 = 항목["snippet"]["topLevelComment"]["snippet"]
+
+                댓글목록.append(
+                    {
+                        "댓글 내용": 댓글정보.get("textDisplay", ""),
+                        "작성 시각(한국시간)": 한국시간으로_바꾸기(댓글정보.get("publishedAt", "")),
+                        "좋아요 수": 댓글정보.get("likeCount", 0),
+                    }
+                )
+            except Exception:
+                continue
+
+        다음페이지 = 데이터.get("nextPageToken")
+
+        if not 다음페이지:
             break
 
-    return comments
+    return 댓글목록
 
 
-# 엑셀에서 한글이 깨지지 않도록 CSV 파일을 만듭니다.
-def make_csv_for_excel(dataframe: pd.DataFrame) -> bytes:
-    return dataframe.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-
-
-# API 키를 안전하게 읽습니다.
-def read_api_key() -> str | None:
-    try:
-        key = st.secrets.get("youtube_api_key", "")
-        if isinstance(key, str) and key.strip():
-            return key.strip()
-        return None
-    except Exception:
-        return None
+def 엑셀용_csv_만들기(표):
+    """엑셀에서 한글이 깨지지 않도록 CSV 파일을 만듭니다."""
+    return 표.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
 
 
 st.title("유튜브 댓글 가져오기")
-st.caption("주소를 넣고 버튼을 누르면 인기순 댓글을 표로 보여줍니다.")
+st.caption("유튜브 주소를 입력하면 인기순 댓글을 표로 보여주고 CSV로 저장할 수 있습니다.")
 
-api_key = read_api_key()
+api_key = 비밀키_읽기()
 
 if not api_key:
-    st.error("api키가 없어요. .streamlit/secrets.toml에 넣어주세요.")
+    st.error("api키가 없어요. .streamlit/secrets.toml에 넣어주세요")
 
-video_address = st.text_input(
+주소 = st.text_input(
     "유튜브 주소",
-    value="https://www.youtube.com/watch?v=WXuK6gekU1Y",
+    value=기본_주소,
     placeholder="유튜브 영상 주소를 입력하세요.",
 )
 
-max_comments = st.number_input(
+가져올_개수 = st.number_input(
     "가져올 댓글 수",
     min_value=1,
     max_value=5000,
@@ -155,73 +220,57 @@ max_comments = st.number_input(
     step=100,
 )
 
-button_disabled = not bool(api_key)
-
-clicked = st.button(
+버튼눌림 = st.button(
     "댓글 가져오기",
     type="primary",
-    disabled=button_disabled,
+    disabled=api_key is None,
 )
 
-if clicked:
-    video_id = get_video_id(video_address)
+if 버튼눌림:
+    영상_id = 영상_id_찾기(주소)
 
-    if not video_id:
+    if not 영상_id:
         st.error("주소가 올바르지 않아요.")
         st.stop()
 
     try:
-        youtube = get_youtube_client(api_key)
-
         with st.spinner("댓글을 가져오는 중입니다."):
-            rows = fetch_comments(youtube, video_id, int(max_comments))
+            댓글목록 = 댓글_가져오기(
+                api_key=api_key,
+                영상_id=영상_id,
+                가져올_개수=int(가져올_개수),
+            )
 
-        if not rows:
+        if not 댓글목록:
             st.warning("가져온 댓글이 없어요.")
             st.stop()
 
-        df = pd.DataFrame(rows)
+        표 = pd.DataFrame(댓글목록)
 
-        st.success(f"댓글 {len(df):,}개를 가져왔어요.")
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.success(f"댓글 {len(표):,}개를 가져왔어요.")
+        st.dataframe(
+            표,
+            use_container_width=True,
+            hide_index=True,
+        )
 
-        csv_data = make_csv_for_excel(df)
+        csv_파일 = 엑셀용_csv_만들기(표)
 
         st.download_button(
             label="CSV 내려받기",
-            data=csv_data,
-            file_name=f"youtube_comments_{video_id}.csv",
+            data=csv_파일,
+            file_name=f"youtube_comments_{영상_id}.csv",
             mime="text/csv",
         )
 
-    except HttpError as error:
-        status = getattr(error.resp, "status", None)
-        reason_text = ""
+    except RuntimeError as 오류:
+        st.error(str(오류))
 
-        try:
-            reason_text = error.error_details[0].get("reason", "")
-        except Exception:
-            reason_text = str(error)
+    except requests.exceptions.Timeout:
+        st.error("댓글을 가져오는 중 문제가 생겼어요. 유튜브 연결 시간이 너무 오래 걸렸어요.")
 
-        reason_text_lower = reason_text.lower()
-        error_text_lower = str(error).lower()
-
-        if status == 403 and (
-            "commentsdisabled" in reason_text_lower
-            or "disabled comments" in error_text_lower
-            or "comments disabled" in error_text_lower
-        ):
-            st.error("이 영상은 댓글을 볼 수 없어요.")
-
-        elif status == 403 and (
-            "quotaexceeded" in reason_text_lower
-            or "dailyLimitExceeded" in str(error)
-            or "quota" in error_text_lower
-        ):
-            st.error("오늘 사용할 수 있는 조회량이 다 됐어요.")
-
-        else:
-            st.error("댓글을 가져오는 중 문제가 생겼어요. 주소와 키를 다시 확인해 주세요.")
+    except requests.exceptions.RequestException:
+        st.error("댓글을 가져오는 중 문제가 생겼어요. 인터넷 연결을 다시 확인해 주세요.")
 
     except Exception:
         st.error("댓글을 가져오는 중 문제가 생겼어요. 주소와 키를 다시 확인해 주세요.")
